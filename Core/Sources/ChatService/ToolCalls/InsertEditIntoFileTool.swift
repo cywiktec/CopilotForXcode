@@ -114,6 +114,59 @@ public class InsertEditIntoFileTool: ICopilotTool {
     public static func applyEdit(
         for fileURL: URL,
         content: String,
+        contextProvider: any ToolContextProvider,
+        xcodeInstance: AppInstanceInspector
+    ) throws -> String {
+        guard let editorElement = Self.getEditorElement(by: xcodeInstance, for: fileURL)
+        else {
+            throw InsertEditError.missingEditorElement(file: fileURL)
+        }
+        
+        // Check if element supports kAXValueAttribute before reading
+        var value: String = ""
+        do {
+            value = try editorElement.copyValue(key: kAXValueAttribute)
+        } catch {
+            if let axError = error as? AXError {
+                Logger.client.error("AX Error code: \(axError.rawValue)")
+            }
+            throw error
+        }
+        
+        let lines = value.components(separatedBy: .newlines)
+        
+        do {
+            try Self.checkOpenedFileURL(for: fileURL, xcodeInstance: xcodeInstance)
+                    
+            try AXHelper().injectUpdatedCodeWithAccessibilityAPI(
+                .init(
+                    content: content,
+                    newSelection: nil,
+                    modifications: [
+                        .deletedSelection(
+                            .init(start: .init(line: 0, character: 0), end: .init(line: lines.count - 1, character: (lines.last?.count ?? 100) - 1))
+                        ),
+                        .inserted(0, [content])
+                    ]
+                ),
+                focusElement: editorElement
+            )
+        } catch {
+            Logger.client.error("Failed to inject code for insert edit into file: \(error.localizedDescription)")
+            throw error
+        }
+        
+        // Verify the content was applied by reading it back
+        let newContent = try Self.getCurrentEditorContent(for: fileURL, by: xcodeInstance)
+        Task {
+            try? await contextProvider.notifyChangeTextDocument(fileURL: fileURL, content: newContent, version: 0)
+        }
+        return newContent
+    }
+    
+    public static func applyEdit(
+        for fileURL: URL,
+        content: String,
         xcodeInstance: AppInstanceInspector
     ) throws -> String {
         guard let editorElement = Self.getEditorElement(by: xcodeInstance, for: fileURL)
@@ -157,6 +210,45 @@ public class InsertEditIntoFileTool: ICopilotTool {
         
         // Verify the content was applied by reading it back
         return try Self.getCurrentEditorContent(for: fileURL, by: xcodeInstance)
+    }
+    
+    public static func applyEdit(
+        for fileURL: URL,
+        content: String,
+        contextProvider: any ToolContextProvider,
+        completion: ((String?, Error?) -> Void)? = nil
+    ) {
+        NSWorkspace.openFileInXcode(fileURL: fileURL) { app, error in
+            do {
+                if let error = error { throw error }
+                
+                guard let app = app
+                else {
+                    throw InsertEditError.openingApplicationUnavailable
+                }
+                
+                let appInstanceInspector = AppInstanceInspector(runningApplication: app)
+                guard appInstanceInspector.isXcode
+                else {
+                    throw InsertEditError.fileNotOpenedInXcode
+                }
+                
+                let newContent = try applyEdit(
+                    for: fileURL,
+                    content: content,
+                    contextProvider: contextProvider,
+                    xcodeInstance: appInstanceInspector
+                )
+                
+                Task {
+                    try? await contextProvider.notifyChangeTextDocument(fileURL: fileURL, content: newContent, version: 0)
+                    if let completion = completion { completion(newContent, nil) }
+                }
+            } catch {
+                if let completion = completion { completion(nil, error) }
+                Logger.client.info("Failed to apply edit for file at \(fileURL), \(error)")
+            }
+        }
     }
     
     public static func applyEdit(
